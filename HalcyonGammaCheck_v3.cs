@@ -22,15 +22,15 @@ using VMS.TPS.Common.Model.Types;
 
 namespace VMS.TPS
 {
-  public class Script
-  {
-    public Script()
+    public class Script
     {
-    }
+        public Script()
+        {
+        }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public void Execute(ScriptContext context , System.Windows.Window window, ScriptEnvironment environment)
-    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public void Execute(ScriptContext context, System.Windows.Window window, ScriptEnvironment environment)
+        {
             // TODO : Add here the code that is called when the script is launched from Eclipse.
             if (context.Patient == null)
             {
@@ -47,7 +47,7 @@ namespace VMS.TPS
     }
 
     // -------------------------------------------------------------------------
-    // LÓGICA GAMMA (Sin cambios)
+    // LÃ“GICA GAMMA
     // -------------------------------------------------------------------------
     public class AnalysisResult
     {
@@ -72,22 +72,29 @@ namespace VMS.TPS
             int sizeY = imgRef.YSize;
             double resX = imgRef.XRes;
 
-            float[,] buffRef = new float[sizeX, sizeY];
-            float[,] buffEval = new float[sizeX, sizeY];
+            // ESAPI Best Practice: GetVoxels requires int[,] arrays
+            int[,] buffRef = new int[sizeX, sizeY];
+            int[,] buffEval = new int[sizeX, sizeY];
 
             imgRef.GetVoxels(0, buffRef);
             imgEval.GetVoxels(0, buffEval);
 
-            double maxDoseRef = 0;
+            int maxDoseRef = 0;
+            int maxDoseEval = 0;
             for (int x = 0; x < sizeX; x++)
+            {
                 for (int y = 0; y < sizeY; y++)
+                {
                     if (buffRef[x, y] > maxDoseRef) maxDoseRef = buffRef[x, y];
+                    if (buffEval[x, y] > maxDoseEval) maxDoseEval = buffEval[x, y];
+                }
+            }
 
-            if (maxDoseRef <= 0) return new AnalysisResult { FieldId = imgRef.Beam.Id, Status = "ERROR", Details = "Ref Vacía" };
+            if (maxDoseRef <= 0) return new AnalysisResult { FieldId = imgRef.Beam.Id, Status = "ERROR", Details = "Ref VacÃ­a" };
 
-            // Auto-Alineación
+            // Auto-AlineaciÃ³n (Using each image's own max dose for thresholding)
             Point comRef = GetCenterOfMass(buffRef, sizeX, sizeY, maxDoseRef * 0.2);
-            Point comEval = GetCenterOfMass(buffEval, sizeX, sizeY, maxDoseRef * 0.2);
+            Point comEval = GetCenterOfMass(buffEval, sizeX, sizeY, maxDoseEval * 0.2);
 
             int shiftX = (int)Math.Round(comRef.X - comEval.X);
             int shiftY = (int)Math.Round(comRef.Y - comEval.Y);
@@ -162,7 +169,7 @@ namespace VMS.TPS
 
         private static bool IsInside(int x, int y, int sx, int sy) => x >= 0 && x < sx && y >= 0 && y < sy;
 
-        private static Point GetCenterOfMass(float[,] img, int sx, int sy, double thresh)
+        private static Point GetCenterOfMass(int[,] img, int sx, int sy, double thresh)
         {
             double sumW = 0, sumX = 0, sumY = 0;
             for (int x = 0; x < sx; x++)
@@ -178,7 +185,7 @@ namespace VMS.TPS
     }
 
     // -------------------------------------------------------------------------
-    // INTERFAZ GRÁFICA (Con opción TODOS LOS CAMPOS)
+    // INTERFAZ GRÃFICA (Con opciÃ³n TODOS LOS CAMPOS)
     // -------------------------------------------------------------------------
     public class MainView : UserControl
     {
@@ -194,7 +201,7 @@ namespace VMS.TPS
         private TextBlock _status;
 
         // Estado
-        private List<PortalDoseImage> _singleFieldImages; // Solo para modo campo único
+        private List<PortalDoseImage> _singleFieldImages; // Solo para modo campo Ãºnico
         private bool _isAllFieldsMode = false;
 
         public MainView(Patient p)
@@ -239,7 +246,7 @@ namespace VMS.TPS
             _cbFields.SelectionChanged += _cbFields_SelectionChanged;
             panelFR.Children.Add(_cbFields);
 
-            panelFR.Children.Add(new TextBlock { Text = "Ref (Sesión 1):", FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) });
+            panelFR.Children.Add(new TextBlock { Text = "Ref (SesiÃ³n 1):", FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) });
             _cbRefImage = new ComboBox { Width = 200, Margin = new Thickness(0, 0, 20, 0) };
             panelFR.Children.Add(_cbRefImage);
 
@@ -311,7 +318,7 @@ namespace VMS.TPS
 
             if (_currentPlan != null)
             {
-                // AGREGAR OPCIÓN DE TODOS LOS CAMPOS
+                // AGREGAR OPCIÃ“N DE TODOS LOS CAMPOS
                 _cbFields.Items.Add("-- ANALIZAR TODOS --");
 
                 foreach (var b in _currentPlan.Beams)
@@ -337,13 +344,13 @@ namespace VMS.TPS
             if (selected == "-- ANALIZAR TODOS --")
             {
                 _isAllFieldsMode = true;
-                _cbRefImage.Items.Add("Automático (Sesión más antigua de cada campo)");
+                _cbRefImage.Items.Add("AutomÃ¡tico (SesiÃ³n mÃ¡s antigua de cada campo)");
                 _cbRefImage.SelectedIndex = 0;
-                _cbRefImage.IsEnabled = false; // Deshabilitar selección manual
+                _cbRefImage.IsEnabled = false; // Deshabilitar selecciÃ³n manual
                 return;
             }
 
-            // CASO: CAMPO ÚNICO (Comportamiento original)
+            // CASO: CAMPO ÃšNICO (Comportamiento original)
             var beam = _currentPlan.Beams.FirstOrDefault(b => b.Id == selected);
             if (beam != null)
             {
@@ -369,21 +376,21 @@ namespace VMS.TPS
             {
                 if (_isAllFieldsMode)
                 {
-                    // LÓGICA PARA TODOS LOS CAMPOS
+                    // LÃ“GICA PARA TODOS LOS CAMPOS
                     if (_currentPlan == null) return;
 
                     foreach (var beam in _currentPlan.Beams)
                     {
                         if (beam.IsSetupField) continue;
 
-                        // Obtener imágenes del campo actual
+                        // Obtener imÃ¡genes del campo actual
                         var fieldImages = new List<PortalDoseImage>();
                         foreach (var img in beam.PortalDoseImages) fieldImages.Add(img);
 
-                        // Necesitamos al menos 2 imágenes
+                        // Necesitamos al menos 2 imÃ¡genes
                         if (fieldImages.Count < 2) continue;
 
-                        // Ordenar y tomar la primera como Referencia Automática
+                        // Ordenar y tomar la primera como Referencia AutomÃ¡tica
                         fieldImages = fieldImages.OrderBy(i => i.CreationDateTime).ToList();
                         var refImg = fieldImages[0];
 
@@ -396,14 +403,14 @@ namespace VMS.TPS
                         }
                     }
 
-                    if (results.Count == 0) MessageBox.Show("No se encontraron suficientes imágenes en los campos del plan.");
+                    if (results.Count == 0) MessageBox.Show("No se encontraron suficientes imÃ¡genes en los campos del plan.");
                 }
                 else
                 {
-                    // LÓGICA PARA UN SOLO CAMPO
+                    // LÃ“GICA PARA UN SOLO CAMPO
                     if (_singleFieldImages == null || _singleFieldImages.Count < 2)
                     {
-                        MessageBox.Show("Se necesitan al menos 2 imágenes para comparar.");
+                        MessageBox.Show("Se necesitan al menos 2 imÃ¡genes para comparar.");
                         return;
                     }
 
@@ -420,7 +427,7 @@ namespace VMS.TPS
                 }
 
                 _grid.ItemsSource = results;
-                _status.Text = $"Completado: {results.Count} análisis.";
+                _status.Text = $"Completado: {results.Count} anÃ¡lisis.";
             }
             catch (Exception ex)
             {
@@ -431,13 +438,22 @@ namespace VMS.TPS
         private void BtnExport_Click(object sender, RoutedEventArgs e)
         {
             var data = _grid.ItemsSource as List<AnalysisResult>;
-            if (data == null || !data.Any()) return;
+            if (data == null || !data.Any()) 
+            {
+                MessageBox.Show("No hay datos para exportar. Ejecute un anÃ¡lisis primero.");
+                return;
+            }
 
             string path = @"C:\Temp\PortalDosimetryReports";
             if (!Directory.Exists(path)) Directory.CreateDirectory(path);
 
             string fieldName = _isAllFieldsMode ? "ALL_FIELDS" : _cbFields.SelectedItem.ToString();
-            string file = Path.Combine(path, $"HalcyonQA_{_patient.Id}_{_currentPlan.Id}_{fieldName}_{DateTime.Now:yyyyMMdd_HHmm}.csv");
+            
+            // Sanitizar Patient ID para evitar caracteres ilegales en el nombre del archivo
+            string safePatientId = string.Join("_", _patient.Id.Split(Path.GetInvalidFileNameChars()));
+            string safePlanId = _currentPlan != null ? string.Join("_", _currentPlan.Id.Split(Path.GetInvalidFileNameChars())) : "NoPlan";
+
+            string file = Path.Combine(path, $"HalcyonQA_{safePatientId}_{safePlanId}_{fieldName}_{DateTime.Now:yyyyMMdd_HHmm}.csv");
 
             try
             {
@@ -446,7 +462,7 @@ namespace VMS.TPS
                     sw.WriteLine("Paciente,Curso,Plan,Campo,Fecha,Sesion,Gamma,Estado,Detalles");
                     foreach (var r in data)
                     {
-                        sw.WriteLine($"{_patient.Id},{_cbCourses.SelectedItem},{_currentPlan.Id},{r.FieldId},{r.Date},{r.SessionNumber},{r.GammaPassRate:F2},{r.Status},{r.Details}");
+                        sw.WriteLine($"{_patient.Id},{_cbCourses.SelectedItem},{safePlanId},{r.FieldId},{r.Date},{r.SessionNumber},{r.GammaPassRate:F2},{r.Status},{r.Details}");
                     }
                 }
                 MessageBox.Show($"Exportado a:\n{file}");
@@ -454,5 +470,4 @@ namespace VMS.TPS
             catch (Exception ex) { MessageBox.Show("Error exportando: " + ex.Message); }
         }
     }
-  }
 }
