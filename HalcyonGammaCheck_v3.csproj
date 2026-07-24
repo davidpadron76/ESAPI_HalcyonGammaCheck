@@ -59,7 +59,13 @@
     <Reference Include="PresentationFramework" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="HalcyonGammaCheck_v3.cs" />
+    <Compile Include="Script.cs" />
+    <Compile Include="AssemblyInfo.cs" />
+    <Compile Include="AnalysisResult.cs" />
+    <Compile Include="PortalDoseSnapshot.cs" />
+    <Compile Include="GammaCalculator.cs" />
+    <Compile Include="MainView.cs" />
+    <Compile Include="ActivityLogger.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

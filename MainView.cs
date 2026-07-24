@@ -3,274 +3,16 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Reflection;
-using System.Runtime.CompilerServices;
-using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
-using VMS.TPS.Common.Model.API; // ESAPI types (ensure project references VMS.TPS.Common.Model.API.dll)
-using VMS.TPS.Common.Model.Types;
-
-// TODO: Replace the following version attributes by creating AssemblyInfo.cs. You can do this in the properties of the Visual Studio project.
-[assembly: AssemblyVersion("1.0.0.1")]
-[assembly: AssemblyFileVersion("1.0.0.1")]
-[assembly: AssemblyInformationalVersion("1.0")]
-
-// TODO: Uncomment the following line if the script requires write access.
-//[assembly: ESAPIScript(IsWriteable = false)]
+using Microsoft.Win32;
+using VMS.TPS.Common.Model.API;
 
 namespace VMS.TPS
 {
-    public class Script
-    {
-        public Script()
-        {
-        }
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        public void Execute(ScriptContext context, System.Windows.Window window, ScriptEnvironment environment)
-        {
-            // TODO : Add here the code that is called when the script is launched from Eclipse.
-            if (context.Patient == null)
-            {
-                MessageBox.Show("Por favor, carga un paciente.");
-                return;
-            }
-
-            var view = new MainView(context.Patient);
-            window.Content = view;
-            window.Title = $"Halcyon PD Constancy Check - {context.Patient.Id} (All Fields)";
-            window.Width = 1000;
-            window.Height = 750;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // LÓGICA GAMMA
-    // -------------------------------------------------------------------------
-    public class AnalysisResult
-    {
-        public string FieldId { get; set; }
-        public string Date { get; set; }
-        public int SessionNumber { get; set; }
-        public double GammaPassRate { get; set; }
-        public string Status { get; set; }
-        public string Details { get; set; }
-    }
-
-    // Copia inmutable de los datos de una PortalDoseImage necesarios para el cálculo de gamma.
-    // Se construye en el hilo de UI (donde es seguro llamar a ESAPI) para que el cálculo puro
-    // pueda ejecutarse después en un hilo de fondo sin volver a tocar objetos ESAPI.
-    public class PortalDoseSnapshot
-    {
-        public string FieldId { get; set; }
-        public string Date { get; set; }
-        public int[,] Voxels { get; set; }
-        public int XSize { get; set; }
-        public int YSize { get; set; }
-        public double XRes { get; set; }
-        public double YRes { get; set; }
-
-        public static PortalDoseSnapshot From(PortalDoseImage img, string fieldIdOverride = null)
-        {
-            int sx = img.XSize;
-            int sy = img.YSize;
-            var buff = new int[sx, sy];
-            img.GetVoxels(0, buff);
-
-            return new PortalDoseSnapshot
-            {
-                FieldId = fieldIdOverride ?? img.Beam?.Id,
-                Date = img.CreationDateTime.HasValue ? img.CreationDateTime.Value.ToShortDateString() : "N/A",
-                Voxels = buff,
-                XSize = sx,
-                YSize = sy,
-                XRes = img.XRes,
-                YRes = img.YRes
-            };
-        }
-    }
-
-    public class GammaCalculator
-    {
-        private const double DTA_CRITERIA = 3.0; // mm
-        private const double DOSE_CRITERIA_PERCENT = 0.03; // 3%
-        private const double THRESHOLD_PERCENT = 0.10; // 10%
-        private const double PASS_LIMIT = 95.0; // %
-
-        // Cálculo puro sobre arrays ya extraídos (sin dependencias de ESAPI): seguro de llamar
-        // desde un hilo de fondo y de paralelizar.
-        public static AnalysisResult Evaluate(PortalDoseSnapshot imgRef, PortalDoseSnapshot imgEval, int sessionIdx)
-        {
-            string fieldId = imgRef.FieldId ?? imgEval.FieldId ?? "N/A";
-            string dateStr = imgEval.Date;
-
-            int sizeX = imgRef.XSize;
-            int sizeY = imgRef.YSize;
-            double resX = imgRef.XRes;
-
-            if (imgEval.XSize != sizeX || imgEval.YSize != sizeY)
-            {
-                return new AnalysisResult
-                {
-                    FieldId = fieldId,
-                    Date = dateStr,
-                    SessionNumber = sessionIdx,
-                    GammaPassRate = 0,
-                    Status = "ERROR",
-                    Details = $"Tamaño de imagen distinto (Ref: {sizeX}x{sizeY}, Eval: {imgEval.XSize}x{imgEval.YSize})"
-                };
-            }
-
-            if (Math.Abs(imgEval.XRes - resX) > 1e-6 || Math.Abs(imgEval.YRes - imgRef.YRes) > 1e-6)
-            {
-                return new AnalysisResult
-                {
-                    FieldId = fieldId,
-                    Date = dateStr,
-                    SessionNumber = sessionIdx,
-                    GammaPassRate = 0,
-                    Status = "ERROR",
-                    Details = $"Resolución distinta (Ref: {resX:F3}mm, Eval: {imgEval.XRes:F3}mm)"
-                };
-            }
-
-            int[,] buffRef = imgRef.Voxels;
-            int[,] buffEval = imgEval.Voxels;
-
-            int maxDoseRef = 0;
-            int maxDoseEval = 0;
-            for (int x = 0; x < sizeX; x++)
-            {
-                for (int y = 0; y < sizeY; y++)
-                {
-                    if (buffRef[x, y] > maxDoseRef) maxDoseRef = buffRef[x, y];
-                    if (buffEval[x, y] > maxDoseEval) maxDoseEval = buffEval[x, y];
-                }
-            }
-
-            if (maxDoseRef <= 0) return new AnalysisResult { FieldId = fieldId, Date = dateStr, SessionNumber = sessionIdx, Status = "ERROR", Details = "Ref Vacía" };
-
-            // Auto-Alineación (Using each image's own max dose for thresholding)
-            Point comRef = GetCenterOfMass(buffRef, sizeX, sizeY, maxDoseRef * 0.2);
-            Point comEval = GetCenterOfMass(buffEval, sizeX, sizeY, maxDoseEval * 0.2);
-
-            int shiftX = (int)Math.Round(comRef.X - comEval.X);
-            int shiftY = (int)Math.Round(comRef.Y - comEval.Y);
-
-            // Gamma
-            double doseTol = maxDoseRef * DOSE_CRITERIA_PERCENT;
-            double distTolSq = DTA_CRITERIA * DTA_CRITERIA;
-            double thresholdVal = maxDoseRef * THRESHOLD_PERCENT;
-            int searchRadiusX = (int)Math.Ceiling(DTA_CRITERIA / resX) + 1;
-
-            // El patrón de desplazamientos (dx, dy) a explorar es el mismo para todos los puntos
-            // de la imagen (depende solo del radio y la resolución), así que se calcula una única
-            // vez, ordenado por distancia ascendente, para poder cortar la búsqueda en cuanto un
-            // punto cumple el criterio de gamma en vez de recorrer siempre toda la ventana.
-            var searchOffsets = BuildSearchOffsets(searchRadiusX, resX, distTolSq);
-
-            int pointsEvaluated = 0;
-            int pointsPassed = 0;
-            object sumLock = new object();
-
-            // Cada fila (x) es independiente: se reparte entre hilos y se combinan los totales al final.
-            Parallel.For(0, sizeX,
-                () => (evaluated: 0, passed: 0),
-                (x, loopState, local) =>
-                {
-                    int localEvaluated = local.evaluated;
-                    int localPassed = local.passed;
-
-                    for (int y = 0; y < sizeY; y++)
-                    {
-                        double dRef = buffRef[x, y];
-                        if (dRef < thresholdVal) continue;
-
-                        localEvaluated++;
-                        int xEvalBase = x - shiftX;
-                        int yEvalBase = y - shiftY;
-
-                        if (IsInside(xEvalBase, yEvalBase, sizeX, sizeY) &&
-                            Math.Abs(dRef - buffEval[xEvalBase, yEvalBase]) <= doseTol)
-                        {
-                            localPassed++;
-                            continue;
-                        }
-
-                        bool passed = false;
-                        foreach (var off in searchOffsets)
-                        {
-                            int i = xEvalBase + off.dx;
-                            int j = yEvalBase + off.dy;
-                            if (!IsInside(i, j, sizeX, sizeY)) continue;
-
-                            double doseDiff = Math.Abs(dRef - buffEval[i, j]);
-                            double gammaSq = (doseDiff * doseDiff) / (doseTol * doseTol) + off.distSqMm / distTolSq;
-
-                            if (gammaSq <= 1.0) { passed = true; break; }
-                        }
-                        if (passed) localPassed++;
-                    }
-
-                    return (localEvaluated, localPassed);
-                },
-                local =>
-                {
-                    lock (sumLock)
-                    {
-                        pointsEvaluated += local.evaluated;
-                        pointsPassed += local.passed;
-                    }
-                });
-
-            double passRate = (double)pointsPassed / Math.Max(1, pointsEvaluated) * 100.0;
-
-            return new AnalysisResult
-            {
-                FieldId = fieldId,
-                Date = dateStr,
-                SessionNumber = sessionIdx,
-                GammaPassRate = passRate,
-                Status = passRate >= PASS_LIMIT ? "APROBADO" : "FALLO",
-                Details = $"Shift: {shiftX},{shiftY} px. Puntos: {pointsEvaluated}"
-            };
-        }
-
-        private static (int dx, int dy, double distSqMm)[] BuildSearchOffsets(int radius, double res, double distTolSq)
-        {
-            var offsets = new List<(int dx, int dy, double distSqMm)>();
-            for (int dx = -radius; dx <= radius; dx++)
-            {
-                for (int dy = -radius; dy <= radius; dy++)
-                {
-                    double distSqMm = (dx * res * dx * res) + (dy * res * dy * res);
-                    if (distSqMm <= distTolSq) offsets.Add((dx, dy, distSqMm));
-                }
-            }
-            return offsets.OrderBy(o => o.distSqMm).ToArray();
-        }
-
-        private static bool IsInside(int x, int y, int sx, int sy) => x >= 0 && x < sx && y >= 0 && y < sy;
-
-        private static Point GetCenterOfMass(int[,] img, int sx, int sy, double thresh)
-        {
-            double sumW = 0, sumX = 0, sumY = 0;
-            for (int x = 0; x < sx; x++)
-            {
-                for (int y = 0; y < sy; y++)
-                {
-                    double val = img[x, y];
-                    if (val > thresh) { sumW += val; sumX += x * val; sumY += y * val; }
-                }
-            }
-            return sumW == 0 ? new Point(sx / 2, sy / 2) : new Point(sumX / sumW, sumY / sumW);
-        }
-    }
-
     // -------------------------------------------------------------------------
     // INTERFAZ GRÁFICA (Con opción TODOS LOS CAMPOS)
     // -------------------------------------------------------------------------
@@ -533,11 +275,18 @@ namespace VMS.TPS
 
                 _grid.ItemsSource = results;
                 _status.Text = $"Completado: {results.Count} análisis.";
+
+                int passCount = results.Count(r => r.Status == "APROBADO");
+                int failCount = results.Count(r => r.Status == "FALLO");
+                int errorCount = results.Count(r => r.Status == "ERROR");
+                string modeLabel = _isAllFieldsMode ? "TODOS_LOS_CAMPOS" : _cbFields.SelectedItem?.ToString();
+                ActivityLogger.Log($"ANALISIS\tPaciente={_patient.Id}\tCurso={_cbCourses.SelectedItem}\tPlan={_currentPlan?.Id}\tCampo={modeLabel}\tTotal={results.Count}\tAprobado={passCount}\tFallo={failCount}\tError={errorCount}");
             }
             catch (Exception ex)
             {
                 MessageBox.Show("Error: " + ex.Message);
                 _status.Text = "Error.";
+                ActivityLogger.Log($"ANALISIS_ERROR\tPaciente={_patient?.Id}\tMensaje={ex.Message}");
             }
             finally
             {
@@ -579,22 +328,35 @@ namespace VMS.TPS
         private void BtnExport_Click(object sender, RoutedEventArgs e)
         {
             var data = _grid.ItemsSource as List<AnalysisResult>;
-            if (data == null || !data.Any()) 
+            if (data == null || !data.Any())
             {
                 MessageBox.Show("No hay datos para exportar. Ejecute un análisis primero.");
                 return;
             }
 
-            string path = @"C:\Temp\PortalDosimetryReports";
-            if (!Directory.Exists(path)) Directory.CreateDirectory(path);
+            string defaultDir = @"C:\Temp\PortalDosimetryReports";
+            try { if (!Directory.Exists(defaultDir)) Directory.CreateDirectory(defaultDir); }
+            catch { /* Si no se puede crear, el diálogo caerá a su carpeta por defecto */ }
 
             string fieldName = _isAllFieldsMode ? "ALL_FIELDS" : _cbFields.SelectedItem.ToString();
-            
+
             // Sanitizar Patient ID para evitar caracteres ilegales en el nombre del archivo
             string safePatientId = string.Join("_", _patient.Id.Split(Path.GetInvalidFileNameChars()));
             string safePlanId = _currentPlan != null ? string.Join("_", _currentPlan.Id.Split(Path.GetInvalidFileNameChars())) : "NoPlan";
 
-            string file = Path.Combine(path, $"HalcyonQA_{safePatientId}_{safePlanId}_{fieldName}_{DateTime.Now:yyyyMMdd_HHmm}.csv");
+            string defaultFileName = $"HalcyonQA_{safePatientId}_{safePlanId}_{fieldName}_{DateTime.Now:yyyyMMdd_HHmm}.csv";
+
+            var dialog = new SaveFileDialog
+            {
+                Title = "Exportar reporte de QA",
+                Filter = "Archivo CSV (*.csv)|*.csv",
+                FileName = defaultFileName,
+                InitialDirectory = Directory.Exists(defaultDir) ? defaultDir : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+            };
+
+            if (dialog.ShowDialog() != true) return; // El usuario canceló
+
+            string file = dialog.FileName;
 
             try
             {
@@ -619,8 +381,13 @@ namespace VMS.TPS
                     }
                 }
                 MessageBox.Show($"Exportado a:\n{file}");
+                ActivityLogger.Log($"EXPORT\tPaciente={_patient.Id}\tArchivo={file}");
             }
-            catch (Exception ex) { MessageBox.Show("Error exportando: " + ex.Message); }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error exportando: " + ex.Message);
+                ActivityLogger.Log($"EXPORT_ERROR\tPaciente={_patient?.Id}\tMensaje={ex.Message}");
+            }
         }
 
         // Escapa un campo para CSV (RFC 4180): entrecomilla si contiene coma, comilla o salto de línea.
