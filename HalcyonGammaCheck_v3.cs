@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -60,6 +61,39 @@ namespace VMS.TPS
         public string Details { get; set; }
     }
 
+    // Copia inmutable de los datos de una PortalDoseImage necesarios para el cálculo de gamma.
+    // Se construye en el hilo de UI (donde es seguro llamar a ESAPI) para que el cálculo puro
+    // pueda ejecutarse después en un hilo de fondo sin volver a tocar objetos ESAPI.
+    public class PortalDoseSnapshot
+    {
+        public string FieldId { get; set; }
+        public string Date { get; set; }
+        public int[,] Voxels { get; set; }
+        public int XSize { get; set; }
+        public int YSize { get; set; }
+        public double XRes { get; set; }
+        public double YRes { get; set; }
+
+        public static PortalDoseSnapshot From(PortalDoseImage img, string fieldIdOverride = null)
+        {
+            int sx = img.XSize;
+            int sy = img.YSize;
+            var buff = new int[sx, sy];
+            img.GetVoxels(0, buff);
+
+            return new PortalDoseSnapshot
+            {
+                FieldId = fieldIdOverride ?? img.Beam?.Id,
+                Date = img.CreationDateTime.HasValue ? img.CreationDateTime.Value.ToShortDateString() : "N/A",
+                Voxels = buff,
+                XSize = sx,
+                YSize = sy,
+                XRes = img.XRes,
+                YRes = img.YRes
+            };
+        }
+    }
+
     public class GammaCalculator
     {
         private const double DTA_CRITERIA = 3.0; // mm
@@ -67,10 +101,12 @@ namespace VMS.TPS
         private const double THRESHOLD_PERCENT = 0.10; // 10%
         private const double PASS_LIMIT = 95.0; // %
 
-        public static AnalysisResult Evaluate(PortalDoseImage imgRef, PortalDoseImage imgEval, int sessionIdx)
+        // Cálculo puro sobre arrays ya extraídos (sin dependencias de ESAPI): seguro de llamar
+        // desde un hilo de fondo y de paralelizar.
+        public static AnalysisResult Evaluate(PortalDoseSnapshot imgRef, PortalDoseSnapshot imgEval, int sessionIdx)
         {
-            string fieldId = imgRef.Beam?.Id ?? imgEval.Beam?.Id ?? "N/A";
-            string dateStr = imgEval.CreationDateTime.HasValue ? imgEval.CreationDateTime.Value.ToShortDateString() : "N/A";
+            string fieldId = imgRef.FieldId ?? imgEval.FieldId ?? "N/A";
+            string dateStr = imgEval.Date;
 
             int sizeX = imgRef.XSize;
             int sizeY = imgRef.YSize;
@@ -102,12 +138,8 @@ namespace VMS.TPS
                 };
             }
 
-            // ESAPI Best Practice: GetVoxels requires int[,] arrays
-            int[,] buffRef = new int[sizeX, sizeY];
-            int[,] buffEval = new int[sizeX, sizeY];
-
-            imgRef.GetVoxels(0, buffRef);
-            imgEval.GetVoxels(0, buffEval);
+            int[,] buffRef = imgRef.Voxels;
+            int[,] buffEval = imgEval.Voxels;
 
             int maxDoseRef = 0;
             int maxDoseEval = 0;
@@ -133,56 +165,67 @@ namespace VMS.TPS
             double doseTol = maxDoseRef * DOSE_CRITERIA_PERCENT;
             double distTolSq = DTA_CRITERIA * DTA_CRITERIA;
             double thresholdVal = maxDoseRef * THRESHOLD_PERCENT;
+            int searchRadiusX = (int)Math.Ceiling(DTA_CRITERIA / resX) + 1;
+
+            // El patrón de desplazamientos (dx, dy) a explorar es el mismo para todos los puntos
+            // de la imagen (depende solo del radio y la resolución), así que se calcula una única
+            // vez, ordenado por distancia ascendente, para poder cortar la búsqueda en cuanto un
+            // punto cumple el criterio de gamma en vez de recorrer siempre toda la ventana.
+            var searchOffsets = BuildSearchOffsets(searchRadiusX, resX, distTolSq);
 
             int pointsEvaluated = 0;
             int pointsPassed = 0;
-            int searchRadiusX = (int)Math.Ceiling(DTA_CRITERIA / resX) + 1;
+            object sumLock = new object();
 
-            for (int x = 0; x < sizeX; x++)
-            {
-                for (int y = 0; y < sizeY; y++)
+            // Cada fila (x) es independiente: se reparte entre hilos y se combinan los totales al final.
+            Parallel.For(0, sizeX,
+                () => (evaluated: 0, passed: 0),
+                (x, loopState, local) =>
                 {
-                    double dRef = buffRef[x, y];
-                    if (dRef < thresholdVal) continue;
+                    int localEvaluated = local.evaluated;
+                    int localPassed = local.passed;
 
-                    pointsEvaluated++;
-                    int xEvalBase = x - shiftX;
-                    int yEvalBase = y - shiftY;
-
-                    if (IsInside(xEvalBase, yEvalBase, sizeX, sizeY))
+                    for (int y = 0; y < sizeY; y++)
                     {
-                        if (Math.Abs(dRef - buffEval[xEvalBase, yEvalBase]) <= doseTol)
+                        double dRef = buffRef[x, y];
+                        if (dRef < thresholdVal) continue;
+
+                        localEvaluated++;
+                        int xEvalBase = x - shiftX;
+                        int yEvalBase = y - shiftY;
+
+                        if (IsInside(xEvalBase, yEvalBase, sizeX, sizeY) &&
+                            Math.Abs(dRef - buffEval[xEvalBase, yEvalBase]) <= doseTol)
                         {
-                            pointsPassed++;
+                            localPassed++;
                             continue;
                         }
-                    }
 
-                    bool passed = false;
-                    int xMin = Math.Max(0, xEvalBase - searchRadiusX);
-                    int xMax = Math.Min(sizeX - 1, xEvalBase + searchRadiusX);
-                    int yMin = Math.Max(0, yEvalBase - searchRadiusX);
-                    int yMax = Math.Min(sizeY - 1, yEvalBase + searchRadiusX);
-
-                    for (int i = xMin; i <= xMax; i++)
-                    {
-                        for (int j = yMin; j <= yMax; j++)
+                        bool passed = false;
+                        foreach (var off in searchOffsets)
                         {
-                            double distSqMm = ((i - xEvalBase) * resX * (i - xEvalBase) * resX) +
-                                              ((j - yEvalBase) * resX * (j - yEvalBase) * resX);
-
-                            if (distSqMm > distTolSq) continue;
+                            int i = xEvalBase + off.dx;
+                            int j = yEvalBase + off.dy;
+                            if (!IsInside(i, j, sizeX, sizeY)) continue;
 
                             double doseDiff = Math.Abs(dRef - buffEval[i, j]);
-                            double gammaSq = (doseDiff * doseDiff) / (doseTol * doseTol) + (distSqMm) / distTolSq;
+                            double gammaSq = (doseDiff * doseDiff) / (doseTol * doseTol) + off.distSqMm / distTolSq;
 
                             if (gammaSq <= 1.0) { passed = true; break; }
                         }
-                        if (passed) break;
+                        if (passed) localPassed++;
                     }
-                    if (passed) pointsPassed++;
-                }
-            }
+
+                    return (localEvaluated, localPassed);
+                },
+                local =>
+                {
+                    lock (sumLock)
+                    {
+                        pointsEvaluated += local.evaluated;
+                        pointsPassed += local.passed;
+                    }
+                });
 
             double passRate = (double)pointsPassed / Math.Max(1, pointsEvaluated) * 100.0;
 
@@ -195,6 +238,20 @@ namespace VMS.TPS
                 Status = passRate >= PASS_LIMIT ? "APROBADO" : "FALLO",
                 Details = $"Shift: {shiftX},{shiftY} px. Puntos: {pointsEvaluated}"
             };
+        }
+
+        private static (int dx, int dy, double distSqMm)[] BuildSearchOffsets(int radius, double res, double distTolSq)
+        {
+            var offsets = new List<(int dx, int dy, double distSqMm)>();
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                for (int dy = -radius; dy <= radius; dy++)
+                {
+                    double distSqMm = (dx * res * dx * res) + (dy * res * dy * res);
+                    if (distSqMm <= distTolSq) offsets.Add((dx, dy, distSqMm));
+                }
+            }
+            return offsets.OrderBy(o => o.distSqMm).ToArray();
         }
 
         private static bool IsInside(int x, int y, int sx, int sy) => x >= 0 && x < sx && y >= 0 && y < sy;
@@ -396,14 +453,20 @@ namespace VMS.TPS
             }
         }
 
-        private void BtnAnalyze_Click(object sender, RoutedEventArgs e)
+        private async void BtnAnalyze_Click(object sender, RoutedEventArgs e)
         {
-            var results = new List<AnalysisResult>();
-            _status.Text = "Procesando...";
+            var btnAnalyze = sender as Button;
+            if (btnAnalyze != null) btnAnalyze.IsEnabled = false;
+            _status.Text = "Leyendo imágenes...";
             _grid.ItemsSource = null; // Limpiar
 
             try
             {
+                // Preparar los trabajos a evaluar. Esto SÍ toca objetos ESAPI (PortalDoseImage,
+                // Beam, etc.), así que debe ejecutarse en el hilo de UI, pero solo copia los
+                // voxeles a memoria — no calcula gamma, por lo que es rápido.
+                var jobs = new List<(PortalDoseSnapshot refImg, PortalDoseSnapshot evalImg, int session, string fieldId)>();
+
                 if (_isAllFieldsMode)
                 {
                     // LÓGICA PARA TODOS LOS CAMPOS
@@ -422,34 +485,22 @@ namespace VMS.TPS
 
                         // Ordenar y tomar la primera como Referencia Automática
                         fieldImages = fieldImages.OrderBy(i => i.CreationDateTime).ToList();
-                        var refImg = fieldImages[0];
+                        var refSnap = PortalDoseSnapshot.From(fieldImages[0], beam.Id);
 
                         // Comparar el resto
                         int counter = 1;
                         for (int i = 1; i < fieldImages.Count; i++) // Empezar en 1 (saltar Ref)
                         {
-                            var evalImg = fieldImages[i];
-                            int session = counter++;
-                            try
-                            {
-                                results.Add(GammaCalculator.Evaluate(refImg, evalImg, session));
-                            }
-                            catch (Exception exField)
-                            {
-                                results.Add(new AnalysisResult
-                                {
-                                    FieldId = beam.Id,
-                                    Date = evalImg.CreationDateTime.HasValue ? evalImg.CreationDateTime.Value.ToShortDateString() : "N/A",
-                                    SessionNumber = session,
-                                    GammaPassRate = 0,
-                                    Status = "ERROR",
-                                    Details = exField.Message
-                                });
-                            }
+                            var evalSnap = PortalDoseSnapshot.From(fieldImages[i], beam.Id);
+                            jobs.Add((refSnap, evalSnap, counter++, beam.Id));
                         }
                     }
 
-                    if (results.Count == 0) MessageBox.Show("No se encontraron suficientes imágenes en los campos del plan.");
+                    if (jobs.Count == 0)
+                    {
+                        MessageBox.Show("No se encontraron suficientes imágenes en los campos del plan.");
+                        return;
+                    }
                 }
                 else
                 {
@@ -462,32 +513,23 @@ namespace VMS.TPS
 
                     int refIdx = _cbRefImage.SelectedIndex;
                     if (refIdx < 0) return;
-                    var refImg = _singleFieldImages[refIdx];
+
+                    string fieldId = _cbFields.SelectedItem?.ToString();
+                    var refSnap = PortalDoseSnapshot.From(_singleFieldImages[refIdx], fieldId);
 
                     int counter = 1;
                     for (int i = 0; i < _singleFieldImages.Count; i++)
                     {
                         if (i == refIdx) continue;
-                        var evalImg = _singleFieldImages[i];
-                        int session = counter++;
-                        try
-                        {
-                            results.Add(GammaCalculator.Evaluate(refImg, evalImg, session));
-                        }
-                        catch (Exception exField)
-                        {
-                            results.Add(new AnalysisResult
-                            {
-                                FieldId = _cbFields.SelectedItem?.ToString(),
-                                Date = evalImg.CreationDateTime.HasValue ? evalImg.CreationDateTime.Value.ToShortDateString() : "N/A",
-                                SessionNumber = session,
-                                GammaPassRate = 0,
-                                Status = "ERROR",
-                                Details = exField.Message
-                            });
-                        }
+                        var evalSnap = PortalDoseSnapshot.From(_singleFieldImages[i], fieldId);
+                        jobs.Add((refSnap, evalSnap, counter++, fieldId));
                     }
                 }
+
+                // El cálculo de gamma es matemática pura sobre arrays ya copiados: se ejecuta en
+                // un hilo de fondo para no congelar la UI, reportando avance por cada comparación.
+                var progress = new Progress<int>(done => _status.Text = $"Procesando... {done}/{jobs.Count}");
+                var results = await Task.Run(() => RunJobs(jobs, progress));
 
                 _grid.ItemsSource = results;
                 _status.Text = $"Completado: {results.Count} análisis.";
@@ -495,7 +537,43 @@ namespace VMS.TPS
             catch (Exception ex)
             {
                 MessageBox.Show("Error: " + ex.Message);
+                _status.Text = "Error.";
             }
+            finally
+            {
+                if (btnAnalyze != null) btnAnalyze.IsEnabled = true;
+            }
+        }
+
+        private static List<AnalysisResult> RunJobs(
+            List<(PortalDoseSnapshot refImg, PortalDoseSnapshot evalImg, int session, string fieldId)> jobs,
+            IProgress<int> progress)
+        {
+            var results = new List<AnalysisResult>(jobs.Count);
+
+            for (int idx = 0; idx < jobs.Count; idx++)
+            {
+                var job = jobs[idx];
+                try
+                {
+                    results.Add(GammaCalculator.Evaluate(job.refImg, job.evalImg, job.session));
+                }
+                catch (Exception exField)
+                {
+                    results.Add(new AnalysisResult
+                    {
+                        FieldId = job.fieldId,
+                        Date = job.evalImg.Date,
+                        SessionNumber = job.session,
+                        GammaPassRate = 0,
+                        Status = "ERROR",
+                        Details = exField.Message
+                    });
+                }
+                progress.Report(idx + 1);
+            }
+
+            return results;
         }
 
         private void BtnExport_Click(object sender, RoutedEventArgs e)
