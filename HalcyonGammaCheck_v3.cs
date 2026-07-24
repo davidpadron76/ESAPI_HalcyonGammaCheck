@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -68,9 +69,38 @@ namespace VMS.TPS
 
         public static AnalysisResult Evaluate(PortalDoseImage imgRef, PortalDoseImage imgEval, int sessionIdx)
         {
+            string fieldId = imgRef.Beam?.Id ?? imgEval.Beam?.Id ?? "N/A";
+            string dateStr = imgEval.CreationDateTime.HasValue ? imgEval.CreationDateTime.Value.ToShortDateString() : "N/A";
+
             int sizeX = imgRef.XSize;
             int sizeY = imgRef.YSize;
             double resX = imgRef.XRes;
+
+            if (imgEval.XSize != sizeX || imgEval.YSize != sizeY)
+            {
+                return new AnalysisResult
+                {
+                    FieldId = fieldId,
+                    Date = dateStr,
+                    SessionNumber = sessionIdx,
+                    GammaPassRate = 0,
+                    Status = "ERROR",
+                    Details = $"Tamaño de imagen distinto (Ref: {sizeX}x{sizeY}, Eval: {imgEval.XSize}x{imgEval.YSize})"
+                };
+            }
+
+            if (Math.Abs(imgEval.XRes - resX) > 1e-6 || Math.Abs(imgEval.YRes - imgRef.YRes) > 1e-6)
+            {
+                return new AnalysisResult
+                {
+                    FieldId = fieldId,
+                    Date = dateStr,
+                    SessionNumber = sessionIdx,
+                    GammaPassRate = 0,
+                    Status = "ERROR",
+                    Details = $"Resolución distinta (Ref: {resX:F3}mm, Eval: {imgEval.XRes:F3}mm)"
+                };
+            }
 
             // ESAPI Best Practice: GetVoxels requires int[,] arrays
             int[,] buffRef = new int[sizeX, sizeY];
@@ -90,7 +120,7 @@ namespace VMS.TPS
                 }
             }
 
-            if (maxDoseRef <= 0) return new AnalysisResult { FieldId = imgRef.Beam.Id, Status = "ERROR", Details = "Ref Vacía" };
+            if (maxDoseRef <= 0) return new AnalysisResult { FieldId = fieldId, Date = dateStr, SessionNumber = sessionIdx, Status = "ERROR", Details = "Ref Vacía" };
 
             // Auto-Alineación (Using each image's own max dose for thresholding)
             Point comRef = GetCenterOfMass(buffRef, sizeX, sizeY, maxDoseRef * 0.2);
@@ -158,8 +188,8 @@ namespace VMS.TPS
 
             return new AnalysisResult
             {
-                FieldId = imgRef.Beam.Id,
-                Date = imgEval.CreationDateTime.HasValue ? imgEval.CreationDateTime.Value.ToShortDateString() : "N/A",
+                FieldId = fieldId,
+                Date = dateStr,
                 SessionNumber = sessionIdx,
                 GammaPassRate = passRate,
                 Status = passRate >= PASS_LIMIT ? "APROBADO" : "FALLO",
@@ -399,7 +429,23 @@ namespace VMS.TPS
                         for (int i = 1; i < fieldImages.Count; i++) // Empezar en 1 (saltar Ref)
                         {
                             var evalImg = fieldImages[i];
-                            results.Add(GammaCalculator.Evaluate(refImg, evalImg, counter++));
+                            int session = counter++;
+                            try
+                            {
+                                results.Add(GammaCalculator.Evaluate(refImg, evalImg, session));
+                            }
+                            catch (Exception exField)
+                            {
+                                results.Add(new AnalysisResult
+                                {
+                                    FieldId = beam.Id,
+                                    Date = evalImg.CreationDateTime.HasValue ? evalImg.CreationDateTime.Value.ToShortDateString() : "N/A",
+                                    SessionNumber = session,
+                                    GammaPassRate = 0,
+                                    Status = "ERROR",
+                                    Details = exField.Message
+                                });
+                            }
                         }
                     }
 
@@ -422,7 +468,24 @@ namespace VMS.TPS
                     for (int i = 0; i < _singleFieldImages.Count; i++)
                     {
                         if (i == refIdx) continue;
-                        results.Add(GammaCalculator.Evaluate(refImg, _singleFieldImages[i], counter++));
+                        var evalImg = _singleFieldImages[i];
+                        int session = counter++;
+                        try
+                        {
+                            results.Add(GammaCalculator.Evaluate(refImg, evalImg, session));
+                        }
+                        catch (Exception exField)
+                        {
+                            results.Add(new AnalysisResult
+                            {
+                                FieldId = _cbFields.SelectedItem?.ToString(),
+                                Date = evalImg.CreationDateTime.HasValue ? evalImg.CreationDateTime.Value.ToShortDateString() : "N/A",
+                                SessionNumber = session,
+                                GammaPassRate = 0,
+                                Status = "ERROR",
+                                Details = exField.Message
+                            });
+                        }
                     }
                 }
 
@@ -462,12 +525,35 @@ namespace VMS.TPS
                     sw.WriteLine("Paciente,Curso,Plan,Campo,Fecha,Sesion,Gamma,Estado,Detalles");
                     foreach (var r in data)
                     {
-                        sw.WriteLine($"{_patient.Id},{_cbCourses.SelectedItem},{safePlanId},{r.FieldId},{r.Date},{r.SessionNumber},{r.GammaPassRate:F2},{r.Status},{r.Details}");
+                        var fields = new[]
+                        {
+                            CsvField(_patient.Id),
+                            CsvField(_cbCourses.SelectedItem?.ToString()),
+                            CsvField(safePlanId),
+                            CsvField(r.FieldId),
+                            CsvField(r.Date),
+                            CsvField(r.SessionNumber.ToString(CultureInfo.InvariantCulture)),
+                            CsvField(r.GammaPassRate.ToString("F2", CultureInfo.InvariantCulture)),
+                            CsvField(r.Status),
+                            CsvField(r.Details)
+                        };
+                        sw.WriteLine(string.Join(",", fields));
                     }
                 }
                 MessageBox.Show($"Exportado a:\n{file}");
             }
             catch (Exception ex) { MessageBox.Show("Error exportando: " + ex.Message); }
+        }
+
+        // Escapa un campo para CSV (RFC 4180): entrecomilla si contiene coma, comilla o salto de línea.
+        private static string CsvField(string value)
+        {
+            string s = value ?? string.Empty;
+            if (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0)
+            {
+                s = "\"" + s.Replace("\"", "\"\"") + "\"";
+            }
+            return s;
         }
     }
 }
